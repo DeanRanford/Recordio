@@ -1,0 +1,340 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>🎙 PCM Audio Recorder (All-In-One)</title>
+<style>
+body {
+  margin: 0;
+  min-height: 100vh;
+  display: grid;
+  place-items: center;
+  background: #0b0c11;
+  font-family: system-ui, sans-serif;
+  color: #eee;
+}
+
+.panel {
+  width: 820px;
+  max-width: 95%;
+  padding: 24px;
+  background: rgba(30,32,45,.75);
+  border-radius: 18px;
+}
+
+.controls {
+  display: flex;
+  gap: 10px;
+  flex-wrap: wrap;
+  margin-bottom: 12px;
+}
+
+button {
+  padding: 10px 18px;
+  border-radius: 10px;
+  border: 1px solid #444;
+  background: #151720;
+  color: #fff;
+  cursor: pointer;
+}
+
+#recordIndicator {
+  display: none;
+  margin-top: 10px;
+  color: #ff5252;
+  font-weight: 600;
+}
+
+canvas {
+  width: 100%;
+  height: 120px;
+  background: #000;
+  border-radius: 10px;
+}
+
+audio {
+  width: 100%;
+  margin-top: 12px;
+}
+</style>
+</head>
+<body>
+
+<div class="panel">
+  <h2>🎙 PCM Audio Recorder</h2>
+
+  <div class="controls">
+    <button id="startMonitor">Start Monitor</button>
+    <button id="stopMonitor">Stop Monitor</button>
+  </div>
+
+  <div class="controls">
+    <button id="startRecord">Start Recording</button>
+    <button id="stopRecord">Stop Recording</button>
+    <button id="saveBtn" disabled>Save WAV</button>
+  </div>
+
+  <label style="display:flex;align-items:center;gap:8px;margin-bottom:10px;">
+    <input type="checkbox" id="monoToggle">
+    Merge stereo to mono (monitor + record)
+  </label>
+
+  <div id="recordIndicator">● Recording…</div>
+
+  <canvas id="waveform"></canvas>
+  <audio id="playback" controls></audio>
+</div>
+
+<script>
+let audioContext, analyser, source, micStream;
+let recorderNode, recordedBuffers = [];
+let animationId;
+
+// mono graph nodes
+let splitter, merger, monoGainL, monoGainR;
+
+const recordIndicator = document.getElementById("recordIndicator");
+const playback = document.getElementById("playback");
+const saveBtn = document.getElementById("saveBtn");
+
+/* ---------------- MIC ---------------- */
+async function getMic() {
+  if (micStream) {
+    micStream.getTracks().forEach(t => t.stop());
+    micStream = null;
+  }
+
+  micStream = await navigator.mediaDevices.getUserMedia({
+    audio: {
+      echoCancellation: false,
+      noiseSuppression: false,
+      autoGainControl: false
+    }
+  });
+
+  return micStream;
+}
+
+/* ---------------- VISUALIZER ---------------- */
+function startVisualizer() {
+  const canvas = document.getElementById("waveform");
+  const ctx = canvas.getContext("2d");
+  canvas.width = canvas.clientWidth;
+
+  analyser.fftSize = 2048;
+  const buffer = new Uint8Array(analyser.fftSize);
+
+  function draw() {
+    if (!analyser) return;
+
+    analyser.getByteTimeDomainData(buffer);
+    ctx.fillStyle = "#000";
+    ctx.fillRect(0,0,canvas.width,canvas.height);
+
+    ctx.strokeStyle = "#4caf50";
+    ctx.beginPath();
+    buffer.forEach((v,i)=>{
+      const x = i * canvas.width / buffer.length;
+      const y = (v/255) * canvas.height;
+      i ? ctx.lineTo(x,y) : ctx.moveTo(x,y);
+    });
+    ctx.stroke();
+
+    animationId = requestAnimationFrame(draw);
+  }
+  draw();
+}
+
+/* ---------------- AUDIO GRAPH ---------------- */
+function rebuildGraph(stream) {
+  if (!audioContext) return;
+
+  try { source?.disconnect(); } catch {}
+  try { splitter?.disconnect(); } catch {}
+  try { merger?.disconnect(); } catch {}
+  try { monoGainL?.disconnect(); } catch {}
+  try { monoGainR?.disconnect(); } catch {}
+
+  source = audioContext.createMediaStreamSource(stream);
+  const mono = document.getElementById("monoToggle").checked;
+
+  if (mono) {
+    splitter = audioContext.createChannelSplitter(2);
+    merger   = audioContext.createChannelMerger(2);
+
+    monoGainL = audioContext.createGain();
+    monoGainR = audioContext.createGain();
+    monoGainL.gain.value = 0.5;
+    monoGainR.gain.value = 0.5;
+
+    source.connect(splitter);
+
+    splitter.connect(monoGainL, 0);
+    splitter.connect(monoGainR, 1);
+
+    monoGainL.connect(merger, 0, 0);
+    monoGainR.connect(merger, 0, 0);
+    monoGainL.connect(merger, 0, 1);
+    monoGainR.connect(merger, 0, 1);
+
+    merger.connect(analyser);
+    merger.connect(recorderNode);
+    merger.connect(audioContext.destination);
+  } else {
+    source.connect(analyser);
+    source.connect(recorderNode);
+    source.connect(audioContext.destination);
+  }
+}
+
+/* ---------------- MONITOR ---------------- */
+document.getElementById("startMonitor").onclick = async () => {
+  if (audioContext) return;
+
+  const stream = await getMic();
+  audioContext = new AudioContext();
+
+  const workletCode = `
+    class RecorderWorklet extends AudioWorkletProcessor {
+      constructor() {
+        super();
+        this.buffers = [];
+        this.recording = false;
+        this.port.onmessage = e => {
+          if (e.data === "start") {
+            this.buffers = [];
+            this.recording = true;
+          }
+          if (e.data === "stop") {
+            this.recording = false;
+            this.port.postMessage(this.buffers);
+          }
+        };
+      }
+      process(inputs) {
+        if (!this.recording) return true;
+        const input = inputs[0];
+        if (input && input.length) {
+          this.buffers.push(input.map(ch => new Float32Array(ch)));
+        }
+        return true;
+      }
+    }
+    registerProcessor("recorder-worklet", RecorderWorklet);
+  `;
+
+  const blob = new Blob([workletCode], { type: "application/javascript" });
+  const url = URL.createObjectURL(blob);
+  await audioContext.audioWorklet.addModule(url);
+
+  analyser = audioContext.createAnalyser();
+  recorderNode = new AudioWorkletNode(audioContext,"recorder-worklet");
+
+  recorderNode.port.onmessage = e => {
+    recordedBuffers = e.data || [];
+    if (!recordedBuffers.length) return;
+
+    const mono = document.getElementById("monoToggle").checked;
+    const wav = encodeWAV(recordedBuffers, audioContext.sampleRate, mono);
+    const wavURL = URL.createObjectURL(wav);
+
+    playback.src = wavURL;
+    saveBtn.disabled = false;
+    saveBtn.onclick = () => {
+      const a = document.createElement("a");
+      a.href = wavURL;
+      a.download = mono ? "recording_mono.wav" : "recording_stereo.wav";
+      a.click();
+    };
+  };
+
+  rebuildGraph(stream);
+  await audioContext.resume();
+  startVisualizer();
+};
+
+document.getElementById("stopMonitor").onclick = async () => {
+  cancelAnimationFrame(animationId);
+
+  micStream?.getTracks().forEach(t=>t.stop());
+  micStream = null;
+
+  if (audioContext) {
+    try { await audioContext.close(); } catch {}
+    audioContext = null;
+  }
+
+  analyser = source = recorderNode = null;
+};
+
+/* ---------------- RECORD ---------------- */
+document.getElementById("startRecord").onclick = () => {
+  if (!recorderNode) return;
+  recordedBuffers = [];
+  recorderNode.port.postMessage("start");
+  recordIndicator.style.display = "block";
+};
+
+document.getElementById("stopRecord").onclick = () => {
+  if (!recorderNode) return;
+  recordIndicator.style.display = "none";
+  recorderNode.port.postMessage("stop");
+};
+
+/* rebuild when toggling mono */
+document.getElementById("monoToggle").onchange = () => {
+  if (micStream && audioContext) rebuildGraph(micStream);
+};
+
+/* ---------------- WAV ENCODER ---------------- */
+function encodeWAV(frames, sampleRate, forceMono=false) {
+  const inputChannels = frames[0].length;
+  const channels = forceMono ? 1 : inputChannels;
+  const length = frames.reduce((s,f)=>s+f[0].length,0);
+
+  const buffer = new ArrayBuffer(44 + length * channels * 2);
+  const view = new DataView(buffer);
+
+  writeString(view,0,"RIFF");
+  view.setUint32(4,36 + length * channels * 2,true);
+  writeString(view,8,"WAVE");
+  writeString(view,12,"fmt ");
+  view.setUint32(16,16,true);
+  view.setUint16(20,1,true);
+  view.setUint16(22,channels,true);
+  view.setUint32(24,sampleRate,true);
+  view.setUint32(28,sampleRate * channels * 2,true);
+  view.setUint16(32,channels * 2,true);
+  view.setUint16(34,16,true);
+  writeString(view,36,"data");
+  view.setUint32(40,length * channels * 2,true);
+
+  let offset = 44;
+
+  frames.forEach(frame=>{
+    for (let i=0;i<frame[0].length;i++) {
+      if (forceMono && inputChannels > 1) {
+        let sum = 0;
+        for (let ch=0; ch<inputChannels; ch++) sum += frame[ch][i];
+        const s = Math.max(-1,Math.min(1,sum / inputChannels));
+        view.setInt16(offset, s * 0x7fff, true);
+        offset += 2;
+      } else {
+        for (let ch=0; ch<inputChannels; ch++) {
+          const s = Math.max(-1,Math.min(1,frame[ch][i]));
+          view.setInt16(offset, s * 0x7fff, true);
+          offset += 2;
+        }
+      }
+    }
+  });
+
+  return new Blob([view],{type:"audio/wav"});
+}
+
+function writeString(v,o,s){
+  for(let i=0;i<s.length;i++) v.setUint8(o+i,s.charCodeAt(i));
+}
+</script>
+</body>
+</html>
